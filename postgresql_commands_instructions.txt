@@ -1,0 +1,62 @@
+Установим postgresql и postgresql-contrib
+root@dev-stage-1:~# apt install postgresql postgresql-contrib
+postgresql установился, смотрим командный интерпретатор, для этого переходим под пользователя postgres и из под него вызовем командный интерпретатор psql:
+root@dev-stage-1:~# su postgres
+postgres@dev-stage-1:/root$ psql
+Команды пострегреса указываются через слеш в начале команды - \. Команда \l выведет список баз данных:
+postgres=# \l
+Команда \du выведет пользователей:
+postgres=# \du
+Команды SQL пишутся заглавными буквами, а значения команд с маленькой, точка запятой в конце. Создать пользователя можно вот так:
+postgres=# CREATE USER user1;
+К каждой постргрес команде можно добавить знак плюса и будут выведены дополнительные поля и информация:
+postgres=# \l+
+Создать базу:
+postgres=# CREATE DATABASE test1;
+База будет создана, но будет пустой.
+Можно наполнить ее вручную, но лучше наполнить ее из вне. Взять дамп и залить ее в свежесозданную пустую бд.
+https://github.com/pthom/northwind_psql - возьмем этот дамп и зальем ее в нашу бд.
+Склонируем его в tmp
+root@dev-stage-1:~# cd /tmp/
+root@dev-stage-1:~# git clone https://github.com/pthom/northwind_psql.git
+Перейдем в папку с директорией northwind_psql
+root@dev-stage-1:~# cd northwind_psql/
+И посмотрим что внутри есть northwind_psql.sql который и содержит инструкции по созданию таблиц и наполнению их данными:
+root@dev-stage-1:~# less northwind.sql
+Переключаемся на пользователя postgresql и катим дамп:
+root@dev-stage-1:~# su postgres
+postgres@dev-stage-1:~# cd northwind_psql/
+postgres@dev-stage-1:/tmp/northwind_psql$ psql -d test1 -f northwind.sql
+Дамп залит.
+Переходим в командный интерпретатор, коннектимся к БД, смотрим какие таблицы есть в БД и какие-нибудь данные из любой таблицы.
+postgres@dev-stage-1:/tmp$ psql
+postgres=# \c test1 
+postgres=# \dt
+postgres=# SELECT * FROM products;
+Как сделать ее бекап? В постгрескл дамп не блокирующий. Можно делать на живой базе. Есть две утилиты pgdump и pgdumpall
+Под пользователем postgres выполнить команду:
+postgres@dev-stage-1:/tmp$ pg_dump test1 > /tmp/dump.sql
+Теперь разберемся с тем чтобы посмотреть что происходит на сервере под капотом через утилиту pg_activity. С помощью этой утилиты можно посмотреть какие транзакции выполняются, найти зависшие транзакции, поубивать ненужные и т.д.
+Сначала установим утилиту:
+root@dev-stage-1:~# apt install pg-activity
+Но сейчас мониторить нечего, так как наш инстанс ничем не загружен. Был поставлен пакет postgresql-contrib в этом пакете есть утилита которая называется pgbench - это утилита для стресс тестирования, добавляет нагрузку.
+Однако изначально нужно настроить postgresql. Открыть из под рута например /etc/postgresql/12/main/pg_hba.conf - это файл для разрешений аутентификаций клиентов, каким клиентам можно подключаться к каким базам данным.
+root@dev-stage-1:~# nano pg_hba.conf
+В файле pg_hba.conf поменять для Database administrative login by Unix domain socket с peer на trust. То есть локальной утилите pg_bench предоставить доступ на использование БД. Затем в "local" is for Unix domain socket connections only поменять тоже на trust.
+В IPv4 local connections и IPv6 local connections с md5 поменять на trust. Затем сохраняем файл и перезапускаем сервис postgresql:
+root@dev-stage-1:~# service postgresql restart
+После перезапуска postgresql убедится что он запустился и прослушивает дефолтный порт:
+root@dev-stage-1:~# ss -tpnln
+Переключаемся на пользователя postgres:
+root@dev-stage-1:~# su postgres
+Стресс тест состоит из двух частей. Первая часть - pg_bench готовит бд для тестирования, добавляет к уже существующей бд какие-то своим данные, для того чтобы с ними работать.
+postgres@dev-stage-1:/root$ pgbench -h localhost -p 5432 -U postgres -i -s 100 test1
+Затем открываем еще раз подключение к этой же вм, но отдельной консолью, чтобы наблюдать через pg_activity за нагрузкой.
+Под пользователем postgres выполнить команду:
+postgres@dev-stage-1:pg_activity
+Вернемся к первому терминалу первой вм, где будем запускать pgbench но уже с нагрузкой:
+postgres@dev-stage-1:/root$ pgbench -h localhost -p 5432 -U postgres -c 50 -j 2 -P 60 -T 600 test1
+где аргумент -с - это количество одновременнов клиентов (сеансов) к бд
+аргумент -j - это количестов рабочих потоков
+-P - отображать прогресс каждые 60 секунд
+-T - на какое время будет производится стресс-тестирование
