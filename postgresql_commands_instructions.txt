@@ -60,3 +60,123 @@ postgres@dev-stage-1:/root$ pgbench -h localhost -p 5432 -U postgres -c 50 -j 2 
 аргумент -j - это количестов рабочих потоков
 -P - отображать прогресс каждые 60 секунд
 -T - на какое время будет производится стресс-тестирование
+Репликация - это копирование данных с одного сервера на другой. Когда изменяем данные все изменения записываются в WAL (Write-ahead log). Если с реплики разрешено читать то она называется
+hot-standby, если нет, то - warm-standby. Репликация бывает асинхронная, то есть запрос сначала выполняется на мастере, а все соотвествующие данные доезжают до реплик отдельно в фоне.
+Синхронная репликая - данные записываются как минимум в wal одной реплики, после чего транзакция выполняется на мастере.
+Обычно в мастер данные записывают, со слейвов читают.
+Итак, настраиваем репликацию.
+На второй ВМ устанавливаем postgresql:
+root@dev-stage-2:~# apt install postgresql
+Версии постгреса на мастере и слейве должны быть одинаковы.
+На первой ВМ открыть файл postgresql.conf:
+root@dev-stage-1:~# nano /etc/postgresql/12/main/postgresql.conf
+В нем раскоментить/отредактировать следующие параметры:
+listen_addresses = '*' - слушать все адреса.
+max_connections = 100 - максимальное количество коннектов к постгресу
+wal_level = replica - раскоментить, параметр определяет как много информации будет записываться в журнал wal.
+wal_log_hints = on
+max_wal_senders = 10 - количество реплик
+wal_keep_segments = 64 - задает число файлов сегментов журнала
+hot_standby = on - можно ли выполнять запросы в процессе восстановления
+Файл сохранить.
+Затем открыть pg_hba.conf чтобы разрешить реплики подключаться и стягивать себе данные:
+root@dev-stage-1:~# nano /etc/postgresql/12/main/pg_hba.conf
+В разаделе # Allow replication connections from localhost, by a user with the
+# replication privilege.
+host    all             all             84.201.177.137/32       md5
+хостам, ко всем бд ото всех пользователей от такого вот ip адреса с маской 32 (т.е. 1 ip адрес), где md5 - это пароль
+и еще сточку:
+host    replication     postgres        84.201.177.137/32       md5
+Сохраяем, перезапускаем postgresql
+root@dev-stage-1:~# service postgresql restart
+Смотрим что поменялось:
+root@dev-stage-1:~# ss -tpnln
+Теперь переходим на слейв вм-2. Физически БД на слейве БД хранится тут:
+root@dev-stage-2:~# cd /var/lib/postgresql/main/base
+В каталоге pg_wal - в нем уже появились бинарники (сегменты)
+В общем на слейве нужно очистить содержимое папки main:
+root@dev-stage-2:~# /var/lib/postgresql/main/base rm -rf main/*
+Вернуться на мастер вм-1 и установить пароль для пользователя postgres:
+root@dev-stage-1:~# su postgres
+postgres@dev-stage-1:/root$ psql
+postgres=# ALTER USER postgres WITH PASSWORD ''
+На вм-2 слейве стартуем реплику:
+root@dev-stage-2:~# pg_basebackup -P -R -X stream -c fast -h 84.201.179.251 -U postgres -D /var/lib/postgresql/main
+Первоначальное копирование пошло. 
+Но тут права у директории main у пользователя/группы main postgres, но все что внутри под рутом, нужно сменить владельца:
+root@dev-stage-2:~# chown -R postgres:postgres /var/lib/postgresql/12/main/
+Перезапускаем на слейве сервис и смотрим:
+root@dev-stage-2:~# service postgresql restart
+root@dev-stage-2:~# ss -tpln
+Проверка репликации:
+postgres=# \l
+должна появится бд test1
+На мастере можно добавить еще одну бд
+postgres=# CREATE DATABASE test3;
+На слейве 
+postgres=# \l
+Должна появится БД test3.
+Посмотреть логи можно тут:
+root@dev-stage-1:~# nano /var/log/postgresql/postgresql-12-main.log
+Полезные утилиты:
+Визуализатор логов - https://github.com/darold/pgbadger
+Балансировщик/прокси - https://www.pgbouncer.org/
+Полезная вещь для настройки постргреса - https://pgtune.leopard.in.ua/
+Сделаем на вм-3 еще одну реплику и настроим временной лаг в 5 мин.
+Ставим на вм-3 postgresql:
+root@dev-stage-3:~# apt install postgresql
+На первой вм в файле pg_hba.conf добавляем вм-3
+root@dev-stage-1:~# nano /etc/postgresql/12/main/pg_hba.conf
+Две строчки:
+host    all             all             84.201.139.208/32       md5
+host    replication     postgres        84.201.139.208/32       md5
+В файле
+root@dev-stage-1:~# nano /etc/postgresql/12/main/postgresql.conf
+В нем раскоментить/отредактировать следующие параметры:
+recovery_min_apply_delay - 5min
+Сохраняем и рестартаем сервис:
+root@dev-stage-1:~# service postgresql restart
+На вм-3 удаляем БД:
+root@dev-stage-2:~# /var/lib/postgresql/main/base rm -rf main/*
+На вм-3 слейве стартуем реплику:
+root@dev-stage-2:~# pg_basebackup -P -R -X stream -c fast -h 84.201.179.251 -U postgres -D /var/lib/postgresql/main
+Меняем владельца
+root@dev-stage-3:/var/lib/postgresql/12/main# chown -R postgres:postgres /var/lib/postgresql/main/
+Проверяем на первой машине создав еще одну БД:
+postgres=# CREATE DATABASE test4;
+Затем создаем в ней таблицу
+postgres=# \c test4
+test4=# CREATE TABLE users(Id SERIAL PRIMARY KEY, Username CHARACTER VARYING(30));
+Смотрим на вм-3 через 5 мин есть ли такая таблица в базе test4:
+postgres=# \c test4
+You are now connected to database "test4" as user "postgres".
+test4=# \dt
+         List of relations
+ Schema | Name  | Type  |  Owner
+--------+-------+-------+----------
+ public | users | table | postgres
+(1 row)
+Выключаем вм-1. 
+В логах постргреса на вм-3 увидим:
+2022-11-20 13:15:29.022 UTC [4657] FATAL:  could not connect to the primary server: could not connect to server: Connection refused
+                Is the server running on host "84.201.179.251" and accepting
+                TCP/IP connections on port 5432?
+2022-11-20 13:17:44.566 UTC [4659] FATAL:  could not connect to the primary server: could not connect to server: Connection timed out
+                Is the server running on host "84.201.179.251" and accepting
+                TCP/IP connections on port 5432?
+Затем на вм-3 выполняем функцию pg_promote:
+postgres=# select pg_promote();
+ pg_promote
+------------
+ t
+(1 row)
+Таким образом в логах увидим следующее:
+2022-11-20 13:18:25.782 UTC [4545] LOG:  received promote request
+2022-11-20 13:18:25.782 UTC [4668] FATAL:  terminating walreceiver process due to administrator command
+2022-11-20 13:18:25.782 UTC [4545] LOG:  redo done at 0/9E01E048
+2022-11-20 13:18:25.782 UTC [4545] LOG:  last completed transaction was at log time 2022-11-20 13:10:27.401373+00
+2022-11-20 13:18:25.788 UTC [4545] LOG:  selected new timeline ID: 2
+2022-11-20 13:18:25.934 UTC [4545] LOG:  archive recovery complete
+2022-11-20 13:18:25.965 UTC [4544] LOG:  database system is ready to accept connections
+
+
